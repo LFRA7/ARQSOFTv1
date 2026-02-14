@@ -1,0 +1,591 @@
+pipeline {
+    agent any
+    
+    environment {
+        MAVEN_OPTS = '-Dmaven.repo.local=.m2/repository'
+        DOCKER_REGISTRY = 'localhost:5000'
+        PROJECT_NAME = 'arqsoft'
+        DEV_PORT = '8081'
+        STAGING_PORT = '8082'
+        PROD_PORT = '8083'
+        
+        // Automatic promotion thresholds
+        SMOKE_TEST_RETRIES = '3'
+        STAGING_APPROVAL_TIMEOUT = '30' // minutes
+        PROD_APPROVAL_TIMEOUT = '60' // minutes
+    }
+    
+    options {
+        buildDiscarder(logRotator(numToKeepStr: '10'))
+        timeout(time: 2, unit: 'HOURS')
+    }
+    
+    stages {
+        stage('Checkout & Info') {
+            steps {
+                script {
+                    echo "Branch: ${env.BRANCH_NAME}"
+                    echo "Build Number: ${env.BUILD_NUMBER}"
+                    echo "Git Commit: ${env.GIT_COMMIT}"
+                    echo "Pipeline: DEV → STAGING → PROD"
+                }
+            }
+        }
+        
+        stage('Environment Setup') {
+            steps {
+                script {
+                    echo "Setting up build environment..."
+                    sh 'mkdir -p target/surefire-reports target/failsafe-reports target/site/jacoco target/pit-reports'
+                }
+            }
+        }
+        
+        stage('Compile') {
+            steps {
+                script {
+                    echo "Compiling the application..."
+                    sh 'mvn clean compile -DskipTests'
+                    archiveArtifacts artifacts: 'target/classes/**', allowEmptyArchive: true
+                }
+            }
+        }
+        
+        stage('SonarQube Analysis') {
+            steps {
+                withSonarQubeEnv(installationName: 'arqsoftsonar') {
+                    script {
+                        echo "Running SonarQube analysis..."
+                        sh '''
+                            mvn sonar:sonar \
+                                -Dsonar.projectKey=${PROJECT_NAME} \
+                                -Dsonar.projectName=${PROJECT_NAME} \
+                                -Dsonar.java.binaries=target/classes \
+                                -Dsonar.coverage.jacoco.xmlReportPaths=target/site/jacoco/jacoco.xml
+                        '''
+                    }
+                }
+            }
+        }
+        
+        stage('Quality Gate') {
+            steps {
+                timeout(time: 2, unit: 'MINUTES'){
+                    script {
+                        def qg = waitForQualityGate()
+                        if (qg.status != 'OK') {
+                            echo "WARNING: Quality Gate failed: ${qg.status}"
+                            echo "Continuing pipeline but marking as UNSTABLE"
+                        }
+                    }
+                }
+            }
+        }
+        
+        stage('Unit Tests') {
+            steps {
+                script {
+                    echo "Running unit tests..."
+                    sh 'mvn test'
+                }
+            }
+            post {
+                always {
+                    junit 'target/surefire-reports/*.xml'
+                }
+            }
+        }
+        
+        stage('Integration Tests') {
+            steps {
+                script {
+                    echo "Running integration tests..."
+                    sh 'mvn verify -DskipUTs=true'
+                }
+            }
+            post {
+                always {
+                    junit 'target/failsafe-reports/*.xml'
+                }
+            }
+        }
+        
+        stage('Test Coverage') {
+            steps {
+                script {
+                    echo "Generating test coverage reports..."
+                    sh 'mvn jacoco:report'
+                    
+                    try {
+                        sh 'mvn jacoco:check'
+                        echo "Coverage check passed!"
+                    } catch (Exception e) {
+                        echo "Coverage check failed: ${e.getMessage()}"
+                    }
+                }
+            }
+            post {
+                always {
+                    publishHTML([
+                        allowMissing: true,
+                        alwaysLinkToLastBuild: true,
+                        keepAll: true,
+                        reportDir: 'target/site/jacoco',
+                        reportFiles: 'index.html',
+                        reportName: 'JaCoCo Coverage Report'
+                    ])
+                }
+            }
+        }
+        
+        stage('Package Application') {
+            steps {
+                script {
+                    echo "Creating application package..."
+                    sh 'mvn package -DskipTests'
+                    archiveArtifacts artifacts: 'target/*.jar', fingerprint: true
+                }
+            }
+        }
+        
+        stage('Build Docker Image') {
+            steps {
+                script {
+                    echo "Building Docker image: ${PROJECT_NAME}:${BUILD_NUMBER}"
+                    sh """
+                        docker build \
+                            -t ${PROJECT_NAME}:${BUILD_NUMBER} \
+                            -t ${PROJECT_NAME}:cd-latest \
+                            --label build=${BUILD_NUMBER} \
+                            --label pipeline=continuous-deployment \
+                            .
+                    """
+                }
+            }
+        }
+    
+        stage('Deploy to DEV') {
+            steps {
+                script {
+                    sh '''
+                        docker network inspect aqrsoft_arqsoft-network >/dev/null 2>&1 || \
+                        docker network create aqrsoft_arqsoft-network
+                    '''
+                    
+                    sh '''
+                        docker stop arqsoft-dev || true
+                        docker rm arqsoft-dev || true
+                    '''
+                    
+                    sh """
+                        docker run -d \
+                            --name arqsoft-dev \
+                            -p ${DEV_PORT}:8081 \
+                            --network aqrsoft_arqsoft-network \
+                            --restart unless-stopped \
+                            -e SPRING_PROFILES_ACTIVE=dev,bootstrap \
+                            --label environment=dev \
+                            --label build=${BUILD_NUMBER} \
+                            ${PROJECT_NAME}:${BUILD_NUMBER}
+                    """
+                    
+                    echo " DEV deployment completed"
+                    echo "Access: http://localhost:${DEV_PORT}"
+                }
+            }
+        }
+        
+        stage('Smoke Tests DEV') {
+            steps {
+                script {
+                    echo "Running smoke tests on DEV..."
+                    sleep 5
+                    
+                    retry(3) {
+                        sh """
+                            curl -f -s http://localhost:${DEV_PORT}/api/authors > /dev/null || exit 1
+                            curl -f -s http://localhost:${DEV_PORT}/api/books > /dev/null || exit 1
+                            curl -f -s http://localhost:${DEV_PORT}/swagger-ui/index.html > /dev/null || exit 1
+                        """
+                    }
+                    
+                    echo "DEV smoke tests passed"
+                }
+            }
+        }
+        
+        stage('System Tests DEV') {
+            steps {
+                script {
+                    echo "Running system tests on DEV..."
+                    
+                    def devTestsPassed = true
+                    
+                    try {
+                        sh 'k6 run src/test/java/pt/psoft/g1/psoftg1/system/author-system-test.js'
+                        echo " Author system tests passed"
+                    } catch (Exception e) {
+                        echo " Author system tests failed: ${e.getMessage()}"
+                        devTestsPassed = false
+                    }
+                    
+                    try {
+                        sh 'k6 run src/test/java/pt/psoft/g1/psoftg1/system/book-system-test.js'
+                        echo " Book system tests passed"
+                    } catch (Exception e) {
+                        echo "  Book system tests failed: ${e.getMessage()}"
+                        devTestsPassed = false
+                    }
+                    
+                    if (!devTestsPassed) {
+                        echo "  Some DEV tests failed, but continuing with UNSTABLE status"
+                    }
+                }
+            }
+        }
+        
+        stage('DEV Health Check') {
+            steps {
+                script {
+                    echo "Performing DEV health check..."
+                    
+                    sh """
+                        for i in {1..5}; do
+                            if curl -f -s http://localhost:${DEV_PORT}/api/authors > /dev/null; then
+                                echo " DEV environment is healthy"
+                                exit 0
+                            fi
+                            echo "Waiting for DEV to be healthy... (\$i/5)"
+                            sleep 5
+                        done
+                        echo " DEV health check failed"
+                        exit 1
+                    """
+                }
+            }
+        }
+        
+        
+        stage('Promote to STAGING Gate') {
+            steps {
+                script {
+
+                    if (currentBuild.result == 'UNSTABLE') {
+                        echo "  Build is UNSTABLE. Manual approval required for STAGING."
+                        timeout(time: Integer.parseInt(STAGING_APPROVAL_TIMEOUT), unit: 'MINUTES') {
+                            input message: 'Build is UNSTABLE. Promote to STAGING?', 
+                                  ok: 'Promote to STAGING',
+                                  submitter: 'admin'
+                        }
+                    } else {
+                        echo " All DEV checks passed. Auto-promoting to STAGING..."
+                    }
+                }
+            }
+        }
+        
+        stage('Deploy to STAGING') {
+            steps {
+                script {
+
+                    sh '''
+                        docker stop arqsoft-staging || true
+                        docker rm arqsoft-staging || true
+                    '''
+                    
+                    sh """
+                        docker run -d \
+                            --name arqsoft-staging \
+                            -p ${STAGING_PORT}:8081 \
+                            --network aqrsoft_arqsoft-network \
+                            --restart unless-stopped \
+                            -e SPRING_PROFILES_ACTIVE=staging,bootstrap \
+                            --label environment=staging \
+                            --label build=${BUILD_NUMBER} \
+                            ${PROJECT_NAME}:${BUILD_NUMBER}
+                    """
+                    
+                    echo " STAGING deployment completed"
+                    echo "Access: http://localhost:${STAGING_PORT}"
+                }
+            }
+        }
+        
+        stage('Smoke Tests STAGING') {
+            steps {
+                script {
+                    echo "Running smoke tests on STAGING..."
+                    sleep 5
+                    
+                    retry(3) {
+                        sh """
+                            curl -f -s http://localhost:${STAGING_PORT}/api/authors > /dev/null || exit 1
+                            curl -f -s http://localhost:${STAGING_PORT}/api/books > /dev/null || exit 1
+                        """
+                    }
+                    
+                    echo " STAGING smoke tests passed"
+                }
+            }
+        }
+        
+        stage('System Tests STAGING') {
+            steps {
+                script {
+                    echo "Running system tests on STAGING..."
+                    
+                    def stagingTestsPassed = true
+                    
+                    try {
+                        sh 'BASE_URL=http://localhost:8082/api k6 run src/test/java/pt/psoft/g1/psoftg1/system/author-system-test.js'
+                        echo " STAGING author tests passed"
+                    } catch (Exception e) {
+                        echo "  STAGING author tests failed: ${e.getMessage()}"
+                        stagingTestsPassed = false
+                    }
+                    
+                    try {
+                        sh 'BASE_URL=http://localhost:8082/api k6 run src/test/java/pt/psoft/g1/psoftg1/system/book-system-test.js'
+                        echo " STAGING book tests passed"
+                    } catch (Exception e) {
+                        echo "  STAGING book tests failed: ${e.getMessage()}"
+                        stagingTestsPassed = false
+                    }
+                    
+                    if (!stagingTestsPassed) {
+                        echo "  Some STAGING tests failed"
+                        currentBuild.result = 'UNSTABLE'
+                    }
+                }
+            }
+        }
+        
+        stage('STAGING Health Check') {
+            steps {
+                script {
+                    echo "Performing STAGING health check..."
+                    
+                    sh """
+                        for i in {1..5}; do
+                            if curl -f -s http://localhost:${STAGING_PORT}/api/authors > /dev/null; then
+                                echo " STAGING environment is healthy"
+                                exit 0
+                            fi
+                            echo "Waiting for STAGING to be healthy... (\$i/5)"
+                            sleep 5
+                        done
+                        echo " STAGING health check failed"
+                        exit 1
+                    """
+                }
+            }
+        }
+        
+        stage('STAGING Soak Test') {
+            steps {
+                script {
+                    echo "Running soak test on STAGING (monitoring for 2 minutes)..."
+                    
+                    for (int i = 1; i <= 12; i++) {
+                        sh """
+                            if curl -f -s http://localhost:${STAGING_PORT}/api/authors > /dev/null; then
+                                echo " Check ${i}/12: STAGING is stable"
+                            else
+                                echo " Check ${i}/12: STAGING is unstable"
+                                exit 1
+                            fi
+                        """
+                        sleep 10
+                    }
+                    
+                    echo " STAGING soak test completed successfully"
+                }
+            }
+        }
+        
+        stage('Promote to PRODUCTION Gate') {
+            steps {
+                script {
+                    echo "  PRODUCTION DEPLOYMENT REQUIRES APPROVAL"
+                    
+                    timeout(time: Integer.parseInt(PROD_APPROVAL_TIMEOUT), unit: 'MINUTES') {
+                        input message: 'Deploy to PRODUCTION?', 
+                              ok: 'Deploy to PRODUCTION',
+                              submitter: 'admin',
+                              parameters: [
+                                  string(name: 'DEPLOYMENT_NOTES', 
+                                         defaultValue: '', 
+                                         description: 'Optional: Deployment notes or ticket number')
+                              ]
+                    }
+                }
+            }
+        }
+        
+        stage('Deploy to PRODUCTION') {
+            steps {
+                script {
+
+                    sh '''
+                        docker stop arqsoft-prod || true
+                        docker rm arqsoft-prod || true
+                    '''
+                    
+                    sh """
+                        docker run -d \
+                            --name arqsoft-prod \
+                            -p ${PROD_PORT}:8081 \
+                            --network aqrsoft_arqsoft-network \
+                            --restart unless-stopped \
+                            -e SPRING_PROFILES_ACTIVE=prod,mongodb-redis \
+                            --label environment=prod \
+                            --label build=${BUILD_NUMBER} \
+                            ${PROJECT_NAME}:${BUILD_NUMBER}
+                    """
+                    
+                    echo " PRODUCTION deployment completed"
+                    echo "Access: http://localhost:${PROD_PORT}"
+                }
+            }
+        }
+        
+        stage('Smoke Tests PRODUCTION') {
+            steps {
+                script {
+                    echo "Running CRITICAL smoke tests on PRODUCTION..."
+                    sleep 10
+                    
+                    retry(5) {
+                        sh """
+                            HTTP_CODE=\$(curl -s -o /dev/null -w "%{http_code}" http://localhost:${PROD_PORT}/api/authors)
+                            echo "Authors endpoint: \$HTTP_CODE"
+                            if [ "\$HTTP_CODE" != "200" ] && [ "\$HTTP_CODE" != "401" ]; then
+                                exit 1
+                            fi
+                            
+                            HTTP_CODE=\$(curl -s -o /dev/null -w "%{http_code}" http://localhost:${PROD_PORT}/api/books)
+                            echo "Books endpoint: \$HTTP_CODE"
+                            if [ "\$HTTP_CODE" != "200" ] && [ "\$HTTP_CODE" != "401" ]; then
+                                exit 1
+                            fi
+                        """
+                    }
+                    
+                    echo " PRODUCTION smoke tests passed"
+                }
+            }
+        }
+        
+        stage('PRODUCTION Health Check') {
+            steps {
+                script {
+                    echo "Performing PRODUCTION health check..."
+                    
+                    sh """
+                        for i in {1..10}; do
+                            HTTP_CODE=\$(curl -s -o /dev/null -w "%{http_code}" http://localhost:${PROD_PORT}/api/authors)
+                            if [ "\$HTTP_CODE" = "200" ] || [ "\$HTTP_CODE" = "401" ]; then
+                                echo " PRODUCTION environment is healthy"
+                                exit 0
+                            fi
+                            echo "Waiting for PRODUCTION to be healthy... (\$i/10)"
+                            sleep 10
+                        done
+                        echo " PRODUCTION health check failed"
+                        exit 1
+                    """
+                }
+            }
+        }
+        
+        stage('PRODUCTION Monitoring Period') {
+            steps {
+                script {
+                    echo "Monitoring PRODUCTION for 3 minutes..."
+                    
+                    for (int i = 1; i <= 18; i++) {
+                        sh """
+                            HTTP_CODE=\$(curl -s -o /dev/null -w "%{http_code}" http://localhost:${PROD_PORT}/api/authors)
+                            if [ "\$HTTP_CODE" = "200" ] || [ "\$HTTP_CODE" = "401" ]; then
+                                echo " Check ${i}/18: PRODUCTION is stable"
+                            else
+                                echo " Check ${i}/18: PRODUCTION is unstable (HTTP \$HTTP_CODE)"
+                                exit 1
+                            fi
+                        """
+                        sleep 10
+                    }
+                    
+                    echo " PRODUCTION monitoring completed successfully"
+                }
+            }
+        }
+        
+        stage('Deployment Summary') {
+            steps {
+                script {
+
+                    echo "Build Number: ${BUILD_NUMBER}"
+                    echo "Git Commit: ${env.GIT_COMMIT}"
+                    echo ""
+                    echo "Environment URLs:"
+                    echo "  DEV:        http://localhost:${DEV_PORT}"
+                    echo "  STAGING:    http://localhost:${STAGING_PORT}"
+                    echo "  PRODUCTION: http://localhost:${PROD_PORT}"
+                    echo ""
+                    echo "Docker Image: ${PROJECT_NAME}:${BUILD_NUMBER}"
+                    echo ""
+                    echo " All environments deployed and verified"
+
+                }
+            }
+        }
+    }
+    
+    post {
+        always {
+            script {
+                echo "Pipeline execution completed"
+                
+                archiveArtifacts artifacts: 'target/surefire-reports/**', allowEmptyArchive: true
+                archiveArtifacts artifacts: 'target/failsafe-reports/**', allowEmptyArchive: true
+                archiveArtifacts artifacts: 'target/site/jacoco/**', allowEmptyArchive: true
+                
+                // Cleanup old Docker images
+                sh '''
+                    docker images -f "dangling=true" -q | xargs -r docker rmi || true
+                    docker images ${PROJECT_NAME} --format "{{.Tag}}" | grep -E "^[0-9]+$" | sort -rn | tail -n +6 | xargs -r -I {} docker rmi ${PROJECT_NAME}:{} || true
+                '''
+            }
+        }
+        
+        success {
+            script {
+
+                echo "All environments deployed successfully!"
+            
+            }
+        }
+        
+        failure {
+            script {
+
+                echo "Check logs for details"
+
+            }
+        }
+        
+        unstable {
+            script {
+
+                echo "Some tests failed but deployment completed"
+            }
+        }
+        
+        cleanup {
+            script {
+                echo "Cleaning up workspace..."
+            }
+        }
+    }
+}

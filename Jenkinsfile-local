@@ -1,0 +1,549 @@
+pipeline {
+    agent any
+    
+    environment {
+        MAVEN_OPTS = '-Dmaven.repo.local=.m2/repository'
+        PROJECT_NAME = 'arqsoft'
+        DEPLOY_DIR = '/opt/arqsoft'
+        DEV_PORT = '8084'
+        STAGING_PORT = '8085'
+        PROD_PORT = '8086'
+        JAVA_OPTS = '-Xmx512m -Xms256m'
+        JAVA_HOME = '/var/lib/jenkins/.sdkman/candidates/java/current'
+        PATH = "${JAVA_HOME}/bin:${env.PATH}"
+    }
+    
+    options {
+        buildDiscarder(logRotator(numToKeepStr: '10'))
+        timeout(time: 30, unit: 'MINUTES')
+    }
+    
+    triggers {
+        pollSCM('H/15 * * * *')
+    }
+    
+    stages {
+        stage('Checkout & Info') {
+            steps {
+                script {
+                    echo "Branch: ${env.BRANCH_NAME}"
+                    echo "Build Number: ${env.BUILD_NUMBER}"
+                    echo "Git Commit: ${env.GIT_COMMIT}"
+                }
+            }
+        }
+        
+        stage('Environment Setup') {
+            steps {
+                script {
+                    echo "Setting up build environment..."
+                    echo "Java Version: ${sh(script: 'java -version', returnStdout: true)}"
+                    echo "Maven Version: ${sh(script: 'mvn --version', returnStdout: true)}"
+                    
+                    sh 'mkdir -p target/surefire-reports'
+                    sh 'mkdir -p target/failsafe-reports'
+                    sh 'mkdir -p target/site/jacoco'
+                    sh 'mkdir -p target/pit-reports'
+
+                    sh "mkdir -p ${DEPLOY_DIR}/dev"
+                    sh "mkdir -p ${DEPLOY_DIR}/dev/logs"
+                    sh "mkdir -p ${DEPLOY_DIR}/dev/backup"
+                    sh "mkdir -p ${DEPLOY_DIR}/staging"
+                    sh "mkdir -p ${DEPLOY_DIR}/staging/logs"
+                    sh "mkdir -p ${DEPLOY_DIR}/staging/backup"
+                    sh "mkdir -p ${DEPLOY_DIR}/prod"
+                    sh "mkdir -p ${DEPLOY_DIR}/prod/logs"
+                    sh "mkdir -p ${DEPLOY_DIR}/prod/backup"
+                }
+            }
+        }
+        
+        stage('Compile & Package') {
+            steps {
+                script {
+                    echo "Compiling and packaging the application..."
+                    sh 'mvn clean compile -DskipTests'
+                    
+                    archiveArtifacts artifacts: 'target/classes/**', allowEmptyArchive: true
+                }
+            }
+        }
+        
+        stage('SonarQube Analysis') {
+            steps {
+                withSonarQubeEnv(installationName: 'arqsoftsonar') {
+                    script {
+                        echo "Running SonarQube analysis..."
+                        sh '''
+                            mvn sonar:sonar \
+                                -Dsonar.projectKey=${PROJECT_NAME} \
+                                -Dsonar.projectName=${PROJECT_NAME} \
+                                -Dsonar.java.binaries=target/classes \
+                                -Dsonar.coverage.jacoco.xmlReportPaths=target/site/jacoco/jacoco.xml
+                        '''
+                    }
+                }
+            }
+        }
+        
+        stage('Quality Gate') {
+            steps {
+                timeout(time: 2, unit: 'MINUTES'){
+                    waitForQualityGate abortPipeline: false
+                }
+            }
+        }
+        
+        stage('Unit Tests') {
+            steps {
+                script {
+                    echo "Running unit tests..."
+                    sh 'mvn test'
+                }
+            }
+            post {
+                always {
+                    junit 'target/surefire-reports/*.xml'
+                }
+            }
+        }
+        
+        stage('Integration Tests') {
+            steps {
+                script {
+                    echo "Running integration tests..."
+                    sh 'mvn verify -DskipUTs=true'
+                }
+            }
+            post {
+                always {
+                    junit 'target/failsafe-reports/*.xml'
+                }
+            }
+        }
+        
+        stage('Test Coverage') {
+            steps {
+                script {
+                    echo "Generating test coverage reports..."
+                    sh 'mvn jacoco:report'
+                    
+                    echo "Checking coverage thresholds..."
+                    try {
+                        sh 'mvn jacoco:check'
+                        echo "Coverage check passed!"
+                    } catch (Exception e) {
+                        echo "Coverage check failed, but continuing pipeline: ${e.getMessage()}"
+                    }
+                }
+            }
+            post {
+                always {
+                    publishHTML([
+                        allowMissing: true,
+                        alwaysLinkToLastBuild: true,
+                        keepAll: true,
+                        reportDir: 'target/site/jacoco',
+                        reportFiles: 'index.html',
+                        reportName: 'JaCoCo Coverage Report'
+                    ])
+                }
+            }
+        }
+        
+        stage('Mutation Testing') {
+             steps {
+                 script {
+                     echo "Running mutation tests..."
+                     try {
+                         sh 'mvn org.pitest:pitest-maven:mutationCoverage'
+                     } catch (Exception e) {
+                         echo "Mutation tests failed, but continuing pipeline: ${e.getMessage()}"
+                         currentBuild.result = 'UNSTABLE'
+                     }
+                 }
+             }
+             post {
+                 always {
+                     publishHTML([
+                         allowMissing: true,
+                         alwaysLinkToLastBuild: true,
+                         keepAll: true,
+                         reportDir: 'target/pit-reports',
+                         reportFiles: 'index.html',
+                         reportName: 'PIT Mutation Testing Report'
+                     ])
+                 }
+             }
+         }
+        
+        stage('Package Application') {
+            steps {
+                script {
+                    echo "Creating application package..."
+                    sh 'mvn package -DskipTests'
+
+                    archiveArtifacts artifacts: 'target/*.jar', fingerprint: true
+                }
+            }
+        }
+        
+        stage('Backup Current Version') {
+            when {
+                expression { 
+                    return env.BRANCH_NAME == 'dev' || env.BRANCH_NAME == 'staging' || env.BRANCH_NAME == 'main'
+                }
+            }
+            steps {
+                script {
+                    def envName = env.BRANCH_NAME == 'main' ? 'prod' : env.BRANCH_NAME
+                    echo "Backing up current ${envName} version..."
+                    sh """
+                        if [ -f ${DEPLOY_DIR}/${envName}/${PROJECT_NAME}.jar ]; then
+                            TIMESTAMP=\$(date +%Y%m%d_%H%M%S)
+                            cp ${DEPLOY_DIR}/${envName}/${PROJECT_NAME}.jar ${DEPLOY_DIR}/${envName}/backup/${PROJECT_NAME}_\${TIMESTAMP}.jar
+                            echo "Backup created: ${PROJECT_NAME}_\${TIMESTAMP}.jar"
+                            
+                            # Keep only last 5 backups
+                            cd ${DEPLOY_DIR}/${envName}/backup
+                            ls -t ${PROJECT_NAME}_*.jar | tail -n +6 | xargs -r rm
+                        else
+                            echo "No existing version to backup"
+                        fi
+                    """
+                }
+            }
+        }
+        
+        stage('Deploy to DEV') {
+            when {
+                expression { env.BRANCH_NAME == 'dev' }
+            }
+            steps {
+                script {
+                    echo "Deploying application to DEV environment on port ${DEV_PORT}"
+
+                    sh """
+                        PID=\$(ps aux | grep "${PROJECT_NAME}.jar" | grep "dev" | grep "${DEV_PORT}" | grep -v grep | awk '{print \$2}')
+                        if [ -n "\$PID" ]; then
+                            echo "Stopping running DEV application (PID: \$PID)..."
+                            kill -15 \$PID
+     
+                            for i in {1..30}; do
+                                if ! ps -p \$PID > /dev/null 2>&1; then
+                                    echo "DEV application stopped gracefully"
+                                    break
+                                fi
+                                sleep 1
+                            done
+
+                            if ps -p \$PID > /dev/null 2>&1; then
+                                echo "Force killing DEV application..."
+                                kill -9 \$PID
+                            fi
+                        else
+                            echo "No running DEV application found"
+                        fi
+                    """
+
+                    sh """
+                        echo "Copying new JAR file to DEV deployment directory..."
+                        cp target/*.jar ${DEPLOY_DIR}/dev/${PROJECT_NAME}.jar
+                        chmod +x ${DEPLOY_DIR}/dev/${PROJECT_NAME}.jar
+                    """
+
+                    sh """
+                        echo "Starting DEV application..."
+                        cd ${DEPLOY_DIR}/dev
+
+                        JENKINS_NODE_COOKIE=dontKillMe nohup java ${JAVA_OPTS} \
+                            -jar ${PROJECT_NAME}.jar \
+                            --server.port=${DEV_PORT} \
+                            --spring.profiles.active=dev,bootstrap \
+                            </dev/null >logs/${PROJECT_NAME}.log 2>&1 &
+                        
+                        JAVA_PID=\$!
+                        echo \$JAVA_PID > ${PROJECT_NAME}.pid
+                        
+                        echo "DEV application started with PID: \$JAVA_PID"
+                        sleep 2
+                    """
+
+                    sh """
+                        echo "Waiting for DEV application to start..."
+                        sleep 10
+                        
+                        PID=\$(cat ${DEPLOY_DIR}/dev/${PROJECT_NAME}.pid)
+                        if ps -p \$PID > /dev/null 2>&1; then
+                            echo "DEV application is running (PID: \$PID)"
+
+                            if netstat -tuln | grep ":${DEV_PORT}" > /dev/null; then
+                                echo "DEV application is listening on port ${DEV_PORT}"
+                            else
+                                echo "WARNING: Port ${DEV_PORT} is not listening yet"
+                            fi
+                        else
+                            echo "ERROR: DEV application failed to start!"
+                            tail -n 50 ${DEPLOY_DIR}/dev/logs/${PROJECT_NAME}.log
+                            exit 1
+                        fi
+                    """
+                    
+                    echo "Application deployed successfully to DEV environment"
+                    echo "Access: http://localhost:${DEV_PORT}"
+                }
+            }
+        }
+
+        stage('System Tests DEV') {
+            when {
+                expression { env.BRANCH_NAME == 'dev' }
+            }
+            steps {
+                script {
+                    echo "Running system tests against DEV environment..."
+                    
+                    try {
+                        echo "Running k6 Author System Tests..."
+                        sh 'k6 run src/test/java/pt/psoft/g1/psoftg1/system/author-system-test.js'
+                        echo "k6 Author tests passed!"
+                    } catch (Exception e) {
+                        echo "k6 Author tests failed, but continuing pipeline: ${e.getMessage()}"
+                    }
+
+                    try {
+                        echo "Running k6 Book System Tests..."
+                        sh 'k6 run src/test/java/pt/psoft/g1/psoftg1/system/book-system-test.js'
+                        echo "k6 Book tests passed!"
+                    } catch (Exception e) {
+                        echo "k6 Book tests failed, but continuing pipeline: ${e.getMessage()}"
+                    }
+                    
+                    echo "System tests completed for DEV"
+                }
+            }
+        }
+
+        stage('Deploy to STAGING') {
+            when {
+                expression { env.BRANCH_NAME == 'staging' }
+            }
+            steps {
+                script {
+                    echo "Deploying application to STAGING environment on port ${STAGING_PORT}"
+
+                    sh """
+                        PID=\$(ps aux | grep "${PROJECT_NAME}.jar" | grep "staging" | grep "${STAGING_PORT}" | grep -v grep | awk '{print \$2}')
+                        if [ -n "\$PID" ]; then
+                            echo "Stopping running STAGING application (PID: \$PID)..."
+                            kill -15 \$PID
+     
+                            for i in {1..30}; do
+                                if ! ps -p \$PID > /dev/null 2>&1; then
+                                    echo "STAGING application stopped gracefully"
+                                    break
+                                fi
+                                sleep 1
+                            done
+
+                            if ps -p \$PID > /dev/null 2>&1; then
+                                echo "Force killing STAGING application..."
+                                kill -9 \$PID
+                            fi
+                        else
+                            echo "No running STAGING application found"
+                        fi
+                    """
+
+                    sh """
+                        echo "Copying new JAR file to STAGING deployment directory..."
+                        cp target/*.jar ${DEPLOY_DIR}/staging/${PROJECT_NAME}.jar
+                        chmod +x ${DEPLOY_DIR}/staging/${PROJECT_NAME}.jar
+                    """
+
+                    sh """
+                        echo "Starting STAGING application..."
+                        cd ${DEPLOY_DIR}/staging
+
+                        JENKINS_NODE_COOKIE=dontKillMe nohup java ${JAVA_OPTS} \
+                            -jar ${PROJECT_NAME}.jar \
+                            --server.port=${STAGING_PORT} \
+                            --spring.profiles.active=staging,bootstrap \
+                            </dev/null >logs/${PROJECT_NAME}.log 2>&1 &
+                        
+                        JAVA_PID=\$!
+                        echo \$JAVA_PID > ${PROJECT_NAME}.pid
+                        
+                        echo "STAGING application started with PID: \$JAVA_PID"
+                        sleep 2
+                    """
+
+                    sh """
+                        echo "Waiting for STAGING application to start..."
+                        sleep 10
+                        
+                        PID=\$(cat ${DEPLOY_DIR}/staging/${PROJECT_NAME}.pid)
+                        if ps -p \$PID > /dev/null 2>&1; then
+                            echo "STAGING application is running (PID: \$PID)"
+
+                            if netstat -tuln | grep ":${STAGING_PORT}" > /dev/null; then
+                                echo "STAGING application is listening on port ${STAGING_PORT}"
+                            else
+                                echo "WARNING: Port ${STAGING_PORT} is not listening yet"
+                            fi
+                        else
+                            echo "ERROR: STAGING application failed to start!"
+                            tail -n 50 ${DEPLOY_DIR}/staging/logs/${PROJECT_NAME}.log
+                            exit 1
+                        fi
+                    """
+                    
+                    echo "Application deployed successfully to STAGING environment"
+                    echo "Access: http://localhost:${STAGING_PORT}"
+                }
+            }
+        }
+
+        stage('System Tests STAGING') {
+            when {
+                expression { env.BRANCH_NAME == 'staging' }
+            }
+            steps {
+                script {
+                    echo "Running system tests against STAGING with partial real data..."
+
+                    try {
+                        echo "Running k6 Author System Tests..."
+                        sh 'BASE_URL=http://localhost:8085/api k6 run src/test/java/pt/psoft/g1/psoftg1/system/author-system-test.js'
+                        echo "k6 Author tests passed!"
+                    } catch (Exception e) {
+                        echo "k6 Author tests failed, but continuing pipeline: ${e.getMessage()}"
+                    }
+
+                    try {
+                        echo "Running k6 Book System Tests..."
+                        sh 'BASE_URL=http://localhost:8085/api k6 run src/test/java/pt/psoft/g1/psoftg1/system/book-system-test.js'
+                        echo "k6 Book tests passed!"
+                    } catch (Exception e) {
+                        echo "k6 Book tests failed, but continuing pipeline: ${e.getMessage()}"
+                    }
+                    
+                    echo "System tests completed for STAGING"
+                }
+            }
+        }
+
+        stage('Deploy to PROD') {
+            when {
+                expression { env.BRANCH_NAME == 'main' }
+            }
+            steps {
+                script {
+                    echo "Deploying application to PRODUCTION environment on port ${PROD_PORT}"
+
+                    sh """
+                        PID=\$(ps aux | grep "${PROJECT_NAME}.jar" | grep "prod" | grep "${PROD_PORT}" | grep -v grep | awk '{print \$2}')
+                        if [ -n "\$PID" ]; then
+                            echo "Stopping running PROD application (PID: \$PID)..."
+                            kill -15 \$PID
+     
+                            for i in {1..30}; do
+                                if ! ps -p \$PID > /dev/null 2>&1; then
+                                    echo "PROD application stopped gracefully"
+                                    break
+                                fi
+                                sleep 1
+                            done
+
+                            if ps -p \$PID > /dev/null 2>&1; then
+                                echo "Force killing PROD application..."
+                                kill -9 \$PID
+                            fi
+                        else
+                            echo "No running PROD application found"
+                        fi
+                    """
+
+                    sh """
+                        echo "Copying new JAR file to PROD deployment directory..."
+                        cp target/*.jar ${DEPLOY_DIR}/prod/${PROJECT_NAME}.jar
+                        chmod +x ${DEPLOY_DIR}/prod/${PROJECT_NAME}.jar
+                    """
+
+                    sh """
+                        echo "Starting PROD application..."
+                        cd ${DEPLOY_DIR}/prod
+
+                        JENKINS_NODE_COOKIE=dontKillMe nohup java ${JAVA_OPTS} \
+                            -jar ${PROJECT_NAME}.jar \
+                            --server.port=${PROD_PORT} \
+                            --spring.profiles.active=prod,mongodb-redis \
+                            </dev/null >logs/${PROJECT_NAME}.log 2>&1 &
+                        
+                        JAVA_PID=\$!
+                        echo \$JAVA_PID > ${PROJECT_NAME}.pid
+                        
+                        echo "PROD application started with PID: \$JAVA_PID"
+                        sleep 2
+                    """
+
+                    sh """
+                        echo "Waiting for PROD application to start..."
+                        sleep 10
+                        
+                        PID=\$(cat ${DEPLOY_DIR}/prod/${PROJECT_NAME}.pid)
+                        if ps -p \$PID > /dev/null 2>&1; then
+                            echo "PROD application is running (PID: \$PID)"
+
+                            if netstat -tuln | grep ":${PROD_PORT}" > /dev/null; then
+                                echo "PROD application is listening on port ${PROD_PORT}"
+                            else
+                                echo "WARNING: Port ${PROD_PORT} is not listening yet"
+                            fi
+                        else
+                            echo "ERROR: PROD application failed to start!"
+                            tail -n 50 ${DEPLOY_DIR}/prod/logs/${PROJECT_NAME}.log
+                            exit 1
+                        fi
+                    """
+                    
+                    echo "Application deployed successfully to PRODUCTION environment"
+                    echo "Access: http://localhost:${PROD_PORT}"
+                }
+            }
+        }
+
+    }
+    
+    post {
+        always {
+            script {
+                echo "Pipeline completed. Cleaning up..."
+
+                archiveArtifacts artifacts: 'target/surefire-reports/**', allowEmptyArchive: true
+                archiveArtifacts artifacts: 'target/failsafe-reports/**', allowEmptyArchive: true
+                archiveArtifacts artifacts: 'target/site/jacoco/**', allowEmptyArchive: true
+                archiveArtifacts artifacts: 'target/pit-reports/**', allowEmptyArchive: true
+            }
+        }
+        
+        success {
+            script {
+                echo "Pipeline succeeded!"
+            }
+        }
+        
+        failure {
+            script {
+                echo "Pipeline failed!"
+            }
+        }
+        
+        cleanup {
+            script {
+                echo "Cleaning up workspace..."
+                sh 'rm -rf ./*'
+            }
+        }
+    }
+}
